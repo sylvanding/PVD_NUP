@@ -27,7 +27,8 @@ from utils.pc_utils import (
     smart_crop_with_augmentation,
     normalize_pointcloud,
     denormalize_pointcloud,
-    augment_pointcloud
+    augment_pointcloud,
+    farthest_point_sampling
 )
 
 
@@ -65,7 +66,7 @@ class NUP96PointClouds(Dataset):
                  num_samples: int = 1024,
                  num_points: int = 2048,
                  split: str = 'train',
-                 normalize_per_shape: bool = True,
+                 normalize_per_shape: bool = False,  # 改为默认全局归一化
                  normalize_std_per_axis: bool = False,
                  crop_ratio_x: float = 0.1,
                  crop_ratio_y: float = 0.1,
@@ -123,16 +124,24 @@ class NUP96PointClouds(Dataset):
                 self.all_points_mean = f['mean'][:]
                 self.all_points_std = f['std'][:]
             
-            self.normalize_per_shape = f.attrs.get('normalize_per_shape', True)
+            self.normalize_per_shape = f.attrs.get('normalize_per_shape', False)
         
-        # 分割训练/测试点
-        # 类似ShapeNet，80%用于训练，20%用于测试
-        train_size = int(0.8 * self.all_points.shape[1])
-        self.train_points = self.all_points[:, :train_size]
-        self.test_points = self.all_points[:, train_size:]
+        # 对于生成模型训练，使用全部点云
+        # 如果点云点数超过 num_points，需要采样
+        B, N, C = self.all_points.shape
+        if N > self.num_points:
+            # 降采样到 num_points
+            sampled_points = []
+            for i in range(B):
+                sampled = farthest_point_sampling(self.all_points[i], self.num_points)
+                sampled_points.append(sampled)
+            self.all_points = np.stack(sampled_points, axis=0)
+        elif N < self.num_points:
+            print(f"Warning: H5 file has {N} points per sample, but num_points={self.num_points}")
+            self.num_points = N
         
-        self.tr_sample_size = min(train_size, self.num_points)
-        self.te_sample_size = min(self.all_points.shape[1] - train_size, self.num_points)
+        # train_points 是完整的点云（用于生成模型）
+        self.train_points = self.all_points  # (B, N, 3)
     
     def _setup_realtime(self, csv_dir: str, num_samples: int,
                        all_points_mean: np.ndarray = None,
@@ -164,7 +173,6 @@ class NUP96PointClouds(Dataset):
             self.all_points_std = all_points_std
             self.all_points = None
             self.train_points = None
-            self.test_points = None
     
     def _pregenerate_samples(self):
         """预生成样本用于计算归一化参数"""
@@ -203,7 +211,7 @@ class NUP96PointClouds(Dataset):
         
         self.all_points = np.stack(samples, axis=0)  # (B, N, 3)
         
-        # 计算归一化参数
+        # 计算归一化参数（全局归一化）
         normalized, self.all_points_mean, self.all_points_std = normalize_pointcloud(
             self.all_points,
             normalize_per_shape=self.normalize_per_shape,
@@ -211,14 +219,7 @@ class NUP96PointClouds(Dataset):
         )
         
         self.all_points = normalized
-        
-        # 分割训练/测试点
-        train_size = int(0.8 * self.all_points.shape[1])
-        self.train_points = self.all_points[:, :train_size]
-        self.test_points = self.all_points[:, train_size:]
-        
-        self.tr_sample_size = min(train_size, self.num_points)
-        self.te_sample_size = min(self.all_points.shape[1] - train_size, self.num_points)
+        self.train_points = self.all_points  # (B, N, 3)
     
     def get_pc_stats(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
         """获取点云的归一化参数"""
@@ -226,7 +227,10 @@ class NUP96PointClouds(Dataset):
             m = self.all_points_mean[idx].reshape(1, -1)
             s = self.all_points_std[idx].reshape(1, -1)
             return m, s
-        return self.all_points_mean.reshape(1, -1), self.all_points_std.reshape(1, -1)
+        # 全局归一化时，返回全局参数
+        mean = np.asarray(self.all_points_mean).flatten()
+        std = np.asarray(self.all_points_std).flatten()
+        return mean.reshape(1, -1), std.reshape(1, -1)
     
     def __len__(self) -> int:
         if self.mode == 'realtime' and self.all_points is None:
@@ -238,27 +242,21 @@ class NUP96PointClouds(Dataset):
             # 实时生成模式
             return self._get_realtime_sample(idx)
         
-        # 从预加载数据获取
-        tr_out = self.train_points[idx]
-        if self.random_subsample:
-            tr_idxs = np.random.choice(tr_out.shape[0], self.tr_sample_size, replace=False)
-        else:
-            tr_idxs = np.arange(self.tr_sample_size)
-        tr_out = torch.from_numpy(tr_out[tr_idxs, :]).float()
+        # 从预加载数据获取完整点云
+        tr_out = self.train_points[idx]  # (N, 3)
         
-        te_out = self.test_points[idx]
-        if self.random_subsample:
-            te_idxs = np.random.choice(te_out.shape[0], self.te_sample_size, replace=False)
-        else:
-            te_idxs = np.arange(self.te_sample_size)
-        te_out = torch.from_numpy(te_out[te_idxs, :]).float()
+        if self.random_subsample and tr_out.shape[0] > self.num_points:
+            # 随机采样
+            tr_idxs = np.random.choice(tr_out.shape[0], self.num_points, replace=False)
+            tr_out = tr_out[tr_idxs, :]
+        
+        tr_out = torch.from_numpy(tr_out).float()
         
         m, s = self.get_pc_stats(idx)
         
         return {
             'idx': idx,
-            'train_points': tr_out,
-            'test_points': te_out,
+            'train_points': tr_out,  # (N, 3)
             'mean': m,
             'std': s,
             'cate_idx': 0,  # NUP96只有一个类别
@@ -303,24 +301,16 @@ class NUP96PointClouds(Dataset):
                 source_idx = np.random.randint(0, len(self.source_points))
                 points = self.source_points[source_idx]
         
-        # 归一化
-        normalized, mean, std = normalize_pointcloud(
-            cropped,
-            normalize_per_shape=True,
-            normalize_std_per_axis=self.normalize_std_per_axis
-        )
+        # 使用全局归一化参数归一化
+        normalized = (cropped - self.all_points_mean) / self.all_points_std
         
-        # 分割训练/测试
-        train_size = int(0.8 * self.num_points)
-        tr_out = torch.from_numpy(normalized[:train_size]).float()
-        te_out = torch.from_numpy(normalized[train_size:]).float()
+        tr_out = torch.from_numpy(normalized).float()
         
         return {
             'idx': idx,
             'train_points': tr_out,
-            'test_points': te_out,
-            'mean': mean,
-            'std': std,
+            'mean': self.all_points_mean,
+            'std': self.all_points_std,
             'cate_idx': 0,
             'sid': 'nup96',
             'mid': f'realtime_{idx:04d}'
@@ -340,10 +330,7 @@ class NUP96PointClouds(Dataset):
         self.all_points_mean = mean
         self.all_points_std = std
         self.all_points = (self.all_points - mean) / std
-        
-        train_size = int(0.8 * self.all_points.shape[1])
-        self.train_points = self.all_points[:, :train_size]
-        self.test_points = self.all_points[:, train_size:]
+        self.train_points = self.all_points
 
 
 def get_nup96_datasets(data_root: str = "/home/djx/data/nup96-large",
@@ -378,8 +365,8 @@ def get_nup96_datasets(data_root: str = "/home/djx/data/nup96-large",
             h5_path=h5_path,
             num_points=num_points,
             split='train',
-            normalize_per_shape=True,
-            random_subsample=True
+            normalize_per_shape=False,  # 全局归一化
+            random_subsample=False
         )
         
         # 验证集使用相同的归一化参数
@@ -388,7 +375,7 @@ def get_nup96_datasets(data_root: str = "/home/djx/data/nup96-large",
             h5_path=h5_path,
             num_points=num_points,
             split='val',
-            normalize_per_shape=True,
+            normalize_per_shape=False,
             random_subsample=False,
             all_points_mean=train_dataset.all_points_mean,
             all_points_std=train_dataset.all_points_std
@@ -401,8 +388,8 @@ def get_nup96_datasets(data_root: str = "/home/djx/data/nup96-large",
             num_samples=num_samples,
             num_points=num_points,
             split='train',
-            normalize_per_shape=True,
-            random_subsample=True,
+            normalize_per_shape=False,
+            random_subsample=False,
             enable_z_filter=enable_z_filter,
             z_filter_method=z_filter_method,
             z_filter_params=z_filter_params
@@ -414,7 +401,7 @@ def get_nup96_datasets(data_root: str = "/home/djx/data/nup96-large",
             num_samples=num_samples // 4,
             num_points=num_points,
             split='val',
-            normalize_per_shape=True,
+            normalize_per_shape=False,
             random_subsample=False,
             all_points_mean=train_dataset.all_points_mean,
             all_points_std=train_dataset.all_points_std,
@@ -439,7 +426,8 @@ if __name__ == "__main__":
         sample = train_ds[0]
         print(f"Sample keys: {sample.keys()}")
         print(f"Train points shape: {sample['train_points'].shape}")
-        print(f"Test points shape: {sample['test_points'].shape}")
+        print(f"Mean: {sample['mean']}")
+        print(f"Std: {sample['std']}")
     except Exception as e:
         print(f"H5 mode test failed (expected if H5 not generated yet): {e}")
     

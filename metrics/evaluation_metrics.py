@@ -1,3 +1,9 @@
+"""
+Evaluation metrics for point cloud generation.
+Note: EMD (Earth Mover's Distance) has been removed due to CUDA compatibility issues.
+Only Chamfer Distance based metrics are available.
+"""
+
 import torch
 import numpy as np
 import warnings
@@ -5,7 +11,6 @@ from scipy.stats import entropy
 from sklearn.neighbors import NearestNeighbors
 from numpy.linalg import norm
 
-from metrics.PyTorchEMD.emd import earth_mover_distance as EMD
 from metrics.ChamferDistancePytorch.chamfer3D.dist_chamfer_3D import chamfer_3DDist
 from metrics.ChamferDistancePytorch.fscore import fscore
 from tqdm import tqdm
@@ -26,13 +31,24 @@ def distChamfer(a, b):
     return P.min(1)[0], P.min(2)[0]
 
 
-def EMD_CD(sample_pcs, ref_pcs, batch_size,  reduced=True):
+def CD_loss(sample_pcs, ref_pcs, batch_size, reduced=True):
+    """
+    Compute Chamfer Distance between sample and reference point clouds.
+    
+    Args:
+        sample_pcs: Sample point clouds (N, num_points, 3)
+        ref_pcs: Reference point clouds (N, num_points, 3)
+        batch_size: Batch size for computation
+        reduced: If True, return mean; otherwise return per-sample distances
+        
+    Returns:
+        Dictionary with 'MMD-CD' and 'fscore' metrics
+    """
     N_sample = sample_pcs.shape[0]
     N_ref = ref_pcs.shape[0]
     assert N_sample == N_ref, "REF:%d SMP:%d" % (N_ref, N_sample)
 
     cd_lst = []
-    emd_lst = []
     fs_lst = []
     iterator = range(0, N_sample, batch_size)
 
@@ -46,34 +62,39 @@ def EMD_CD(sample_pcs, ref_pcs, batch_size,  reduced=True):
         fs_lst.append(fs)
         cd_lst.append(dl.mean(dim=1) + dr.mean(dim=1))
 
-        emd_batch = EMD(sample_batch.cuda(), ref_batch.cuda(), transpose=False)
-        emd_lst.append(emd_batch)
-
     if reduced:
         cd = torch.cat(cd_lst).mean()
-        emd = torch.cat(emd_lst).mean()
     else:
         cd = torch.cat(cd_lst)
-        emd = torch.cat(emd_lst)
     fs_lst = torch.cat(fs_lst).mean()
     results = {
         'MMD-CD': cd,
-        'MMD-EMD': emd,
         'fscore': fs_lst
     }
     return results
 
-def _pairwise_EMD_CD_(sample_pcs, ref_pcs, batch_size, accelerated_cd=True):
+
+def _pairwise_CD_(sample_pcs, ref_pcs, batch_size, accelerated_cd=True):
+    """
+    Compute pairwise Chamfer Distance between sample and reference point clouds.
+    
+    Args:
+        sample_pcs: Sample point clouds
+        ref_pcs: Reference point clouds
+        batch_size: Batch size for computation
+        accelerated_cd: Use accelerated CD computation
+        
+    Returns:
+        all_cd: Pairwise Chamfer distances (N_sample, N_ref)
+    """
     N_sample = sample_pcs.shape[0]
     N_ref = ref_pcs.shape[0]
     all_cd = []
-    all_emd = []
     iterator = range(N_sample)
-    for sample_b_start in tqdm(iterator):
+    for sample_b_start in tqdm(iterator, desc="Computing pairwise CD"):
         sample_batch = sample_pcs[sample_b_start]
 
         cd_lst = []
-        emd_lst = []
         for ref_b_start in range(0, N_ref, batch_size):
             ref_b_end = min(N_ref, ref_b_start + batch_size)
             ref_batch = ref_pcs[ref_b_start:ref_b_end]
@@ -85,18 +106,12 @@ def _pairwise_EMD_CD_(sample_pcs, ref_pcs, batch_size, accelerated_cd=True):
             dl, dr, _, _ = cham3D(sample_batch_exp.cuda(), ref_batch.cuda())
             cd_lst.append((dl.mean(dim=1) + dr.mean(dim=1)).view(1, -1).detach().cpu())
 
-            emd_batch = EMD(sample_batch_exp.cuda(), ref_batch.cuda(), transpose=False)
-            emd_lst.append(emd_batch.view(1, -1).detach().cpu())
-
         cd_lst = torch.cat(cd_lst, dim=1)
-        emd_lst = torch.cat(emd_lst, dim=1)
         all_cd.append(cd_lst)
-        all_emd.append(emd_lst)
 
     all_cd = torch.cat(all_cd, dim=0)  # N_sample, N_ref
-    all_emd = torch.cat(all_emd, dim=0)  # N_sample, N_ref
 
-    return all_cd, all_emd
+    return all_cd
 
 
 # Adapted from https://github.com/xuqiantong/GAN-Metrics/blob/master/framework/metric.py
@@ -148,31 +163,33 @@ def lgan_mmd_cov(all_dist):
 
 
 def compute_all_metrics(sample_pcs, ref_pcs, batch_size):
+    """
+    Compute all evaluation metrics (CD-based only, EMD removed).
+    
+    Args:
+        sample_pcs: Generated sample point clouds
+        ref_pcs: Reference point clouds
+        batch_size: Batch size for computation
+        
+    Returns:
+        Dictionary of metrics
+    """
     results = {}
 
-    M_rs_cd, M_rs_emd = _pairwise_EMD_CD_(ref_pcs, sample_pcs, batch_size)
+    M_rs_cd = _pairwise_CD_(ref_pcs, sample_pcs, batch_size)
 
     res_cd = lgan_mmd_cov(M_rs_cd.t())
     results.update({
         "%s-CD" % k: v for k, v in res_cd.items()
     })
 
-    res_emd = lgan_mmd_cov(M_rs_emd.t())
-    results.update({
-        "%s-EMD" % k: v for k, v in res_emd.items()
-    })
-
-    M_rr_cd, M_rr_emd = _pairwise_EMD_CD_(ref_pcs, ref_pcs, batch_size)
-    M_ss_cd, M_ss_emd = _pairwise_EMD_CD_(sample_pcs, sample_pcs, batch_size)
+    M_rr_cd = _pairwise_CD_(ref_pcs, ref_pcs, batch_size)
+    M_ss_cd = _pairwise_CD_(sample_pcs, sample_pcs, batch_size)
 
     # 1-NN results
     one_nn_cd_res = knn(M_rr_cd, M_rs_cd, M_ss_cd, 1, sqrt=False)
     results.update({
         "1-NN-CD-%s" % k: v for k, v in one_nn_cd_res.items() if 'acc' in k
-    })
-    one_nn_emd_res = knn(M_rr_emd, M_rs_emd, M_ss_emd, 1, sqrt=False)
-    results.update({
-        "1-NN-EMD-%s" % k: v for k, v in one_nn_emd_res.items() if 'acc' in k
     })
 
     return results
@@ -312,11 +329,5 @@ if __name__ == "__main__":
     r_dist = min_r.mean().cpu().detach().item()
     print(l_dist, r_dist)
 
-
-    emd_batch = EMD(x.cuda(), y.cuda(), False)
-    print(emd_batch.shape)
-    print(emd_batch.mean().detach().item())
-
     jsd = jsd_between_point_cloud_sets(x.numpy(), y.numpy())
     print(jsd)
-

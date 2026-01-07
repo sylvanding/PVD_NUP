@@ -149,9 +149,11 @@ def visualize_pointcloud_2d(points: np.ndarray, out_file: str,
     fig, ax = plt.subplots(figsize=figsize)
     
     if color_by_z:
+        z_values = np.asarray(points[:, 2]).flatten().astype(np.float64)
         scatter = ax.scatter(points[:, 0], points[:, 1], 
-                           c=points[:, 2], s=point_size, 
-                           cmap=cmap, alpha=0.8)
+                           c=z_values, s=point_size, 
+                           cmap=cmap, alpha=0.8,
+                           vmin=float(z_values.min()), vmax=float(z_values.max()))
         plt.colorbar(scatter, ax=ax, label='z [nm]')
     else:
         ax.scatter(points[:, 0], points[:, 1], s=point_size, alpha=0.8)

@@ -1,10 +1,85 @@
+# IDE and editor
 .idea
+.vscode
+*.swp
+*.swo
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info
+dist
+build
+eggs
+parts
+bin
+var
+sdist
+develop-eggs
+.installed.cfg
+lib
+lib64
+
+# Virtual environments
+venv
+env
+.env
+
+# Data and output
 data
 output
-__pycache__
+
+# Training outputs (generated during training)
+runs/
+tensorboard/
+generated_images/
+generated_points/
+checkpoints/
+
+# Experiment outputs (timestamped directories)
+train_generation_*/
+
+# Model weights and checkpoints
+*.pth
+*.pt
+*.ckpt
+eval_model
+eval_data
+
+# Images and data files
 *.png
+*.jpg
+*.jpeg
+*.gif
 *.net
 *.npy
 *.npz
-eval_model
-eval_data
+
+# Large data files
+*.h5
+*.hdf5
+*.csv
+*.ply
+*.obj
+
+# Jupyter notebooks
+.ipynb_checkpoints
+*.ipynb
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp

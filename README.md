@@ -14,29 +14,39 @@ Implementation of Shape Generation and Completion Through Point-Voxel Diffusion
 Make sure the following environments are installed.
 
 ```
-python==3.6
-pytorch==1.4.0
-torchvision==0.5.0
-cudatoolkit==10.1
-matplotlib==2.2.5
-tqdm==4.32.1
-open3d==0.9.0
-trimesh=3.7.12
-scipy==1.5.1
+python>=3.11
+pytorch>=2.8.0
+torchvision>=0.23.0
+cuda>=12.8
+matplotlib>=3.4.0
+tqdm>=4.60.0
+open3d>=0.18.0
+trimesh>=4.0.0
+scipy>=1.10.0
+tensorboard>=2.15.0
+h5py>=3.0.0
 ```
 
-Install PyTorchEMD by
 ```
-cd metrics/PyTorchEMD
-python setup.py install
-cp build/**/emd_cuda.cpython-36m-x86_64-linux-gnu.so .
+pip install torch-scatter torch-sparse torch-cluster torch-spline-conv torch-geometric  -f https://data.pyg.org/whl/torch-2.8.0+cu128.html
 ```
 
-The code was tested on Unbuntu with Titan RTX. 
+Install dependencies using:
+```bash
+pip install -r requirement_voxel.txt
+```
+
+The code was tested on Ubuntu with Nvidia RTX 5090. 
 
 ## Data
 
-For generation, we use ShapeNet point cloud, which can be downloaded [here](https://github.com/stevenygd/PointFlow).
+For NUP96 point cloud generation, we use preprocessed H5 files generated from SMLM data.
+
+Data preprocessing pipeline:
+1. Run data cleaning scripts in `data_prepare/` directory
+2. Use `data_prepare/6-csv2h5.py` to convert CSV point clouds to H5 format
+
+For original ShapeNet data, point clouds can be downloaded [here](https://github.com/stevenygd/PointFlow).
 
 For completion, we use ShapeNet rendering provided by [GenRe](https://github.com/xiumingzhang/GenRe-ShapeHD).
 We provide script `convert_cam_params.py` to process the provided data.
@@ -53,6 +63,12 @@ Pretrained models can be downloaded [here](https://drive.google.com/drive/folder
 
 ## Training:
 
+For NUP96 point cloud generation:
+```bash
+$ python train_generation.py --dataroot /path/to/nup96/data --npoints 2048 --bs 16
+```
+
+For ShapeNet (original usage):
 ```bash
 $ python train_generation.py --category car|chair|airplane
 ```
@@ -63,6 +79,13 @@ Please refer to the python file for optimal training parameters.
 
 ```bash
 $ python train_generation.py --category car|chair|airplane --model MODEL_PATH
+```
+
+## TensorBoard
+
+Training logs and visualizations are saved to `runs/` directory. View with:
+```bash
+$ tensorboard --logdir runs/
 ```
 
 ## Results

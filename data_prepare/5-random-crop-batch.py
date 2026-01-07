@@ -125,12 +125,12 @@ def main():
     # 设置路径
     DATA_ROOT = "/home/djx/data/nup96-large"
     INPUT_DIR = os.path.join(DATA_ROOT, "1-clean-csv")
-    OUTPUT_DIR = os.path.join(DATA_ROOT, "5-random-crop-batch-csv")
+    OUTPUT_DIR = os.path.join(DATA_ROOT, "5-random-crop-batch-csv-2")
     
     # ========================================
     # 主要参数配置
     # ========================================
-    NUM_SAMPLES = 2048  # 生成大批量样本
+    NUM_SAMPLES = 2048*16  # 生成大批量样本
     TARGET_POINTS = 2048  # 每个样本的点数
     INITIAL_CROP_RATIO = 0.1  # 初始裁剪比例 (x和y方向各1/10)
     
