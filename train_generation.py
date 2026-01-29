@@ -40,10 +40,15 @@ from utils.visualize import *
 from datetime import datetime  # 必须在 file_utils import * 之后，避免被覆盖
 from utils.pc_utils import visualize_pointcloud_2d, denormalize_pointcloud
 from model.pvcnn_generation import PVCNN2Base
+from model.pointcnn_generation import PointCNN2
+from model.gravnetconv_generation import GravNet2
 import torch.distributed as dist
 
 # Import dataset classes
-from datasets.nup96_data_pc import NUP96PointClouds, get_nup96_datasets
+from datasets.nup96_data_pc import (
+    NUP96PointClouds, get_nup96_datasets,
+    NUP96ClusteredPointClouds, get_clustered_nup96_datasets
+)
 
 
 '''
@@ -465,14 +470,68 @@ class PVCNN2(PVCNN2Base):
         )
 
 
+def get_model_class(model_type):
+    """Get model class based on model type string."""
+    if model_type == 'pvcnn':
+        return PVCNN2
+    elif model_type == 'pointcnn':
+        return PointCNN2
+    elif model_type == 'gravnet':
+        return GravNet2
+    else:
+        raise ValueError(f"Unknown model type: {model_type}. Choose from 'pvcnn', 'pointcnn', or 'gravnet'")
+
+
 class Model(nn.Module):
     def __init__(self, args, betas, loss_type: str, model_mean_type: str, model_var_type:str):
         super(Model, self).__init__()
         self.diffusion = GaussianDiffusion(betas, loss_type, model_mean_type, model_var_type)
 
-        self.model = PVCNN2(num_classes=args.nc, embed_dim=args.embed_dim, use_att=args.attention,
-                            dropout=args.dropout, extra_feature_channels=0,
-                            voxel_resolution_multiplier=args.voxel_resolution_multiplier)
+        # Select model based on model_type argument
+        ModelClass = get_model_class(args.model_type)
+        
+        if args.model_type == 'pointcnn':
+            # PointCNN with configurable capacity
+            self.model = ModelClass(
+                num_classes=args.nc, 
+                embed_dim=args.embed_dim, 
+                use_att=args.attention,
+                dropout=args.dropout, 
+                extra_feature_channels=0,
+                width_multiplier=args.pointcnn_width_multiplier,
+                base_channels=args.pointcnn_base_channels,
+                kernel_size=args.pointcnn_kernel_size,
+                num_layers=args.pointcnn_num_layers,
+                downsample_ratio=args.pointcnn_downsample_ratio,
+                npoints=args.npoints  # Pass npoints for kernel size calculation
+            )
+        elif args.model_type == 'gravnet':
+            # GravNet with configurable capacity
+            self.model = ModelClass(
+                num_classes=args.nc,
+                embed_dim=args.embed_dim,
+                use_att=args.attention,
+                dropout=args.dropout,
+                extra_feature_channels=0,
+                width_multiplier=args.gravnet_width_multiplier,
+                base_channels=args.gravnet_base_channels,
+                space_dimensions=args.gravnet_space_dimensions,
+                propagate_dimensions=args.gravnet_propagate_dimensions,
+                k=args.gravnet_k,
+                num_layers=args.gravnet_num_layers,
+                downsample_ratio=args.gravnet_downsample_ratio,
+                npoints=args.npoints
+            )
+        else:
+            # PVCNN
+            self.model = ModelClass(
+                num_classes=args.nc, 
+                embed_dim=args.embed_dim, 
+                use_att=args.attention,
+                dropout=args.dropout, 
+                extra_feature_channels=0,
+                voxel_resolution_multiplier=args.voxel_resolution_multiplier
+            )
 
     def prior_kl(self, x0):
         return self.diffusion._prior_bpd(x0)
@@ -558,14 +617,25 @@ def get_betas(schedule_type, b_start, b_end, time_num):
 
 def get_dataset(opt):
     """
-    Get NUP96 dataset from H5 file
+    Get NUP96 dataset based on dataset_mode
+    
+    Modes:
+        - 'h5': 从预处理的 H5 文件加载（全局归一化）
+        - 'realtime': 实时从 CSV 文件裁剪
+        - 'clustered': 从聚类核孔 H5 文件加载（minmax 归一化）
     """
-    train_dataset, val_dataset = get_nup96_datasets(
-        data_root=opt.dataroot,
-        mode='h5',
-        num_points=opt.npoints,
-        num_samples=opt.num_samples
-    )
+    if opt.dataset_mode == 'clustered':
+        train_dataset, val_dataset = get_clustered_nup96_datasets(
+            data_root=opt.dataroot,
+            num_points=opt.npoints
+        )
+    else:
+        train_dataset, val_dataset = get_nup96_datasets(
+            data_root=opt.dataroot,
+            mode=opt.dataset_mode,
+            num_points=opt.npoints,
+            num_samples=opt.num_samples
+        )
     return train_dataset, val_dataset
 
 
@@ -601,17 +671,21 @@ def get_dataloader(opt, train_dataset, test_dataset=None):
     return train_dataloader, test_dataloader, train_sampler, test_sampler
 
 
-def save_generated_samples(gen_points, mean, std, epoch, output_dir, sample_type='eval'):
+def save_generated_samples(gen_points, mean, std, epoch, output_dir, sample_type='eval',
+                          normalize_mode='standard', min_vals=None, max_vals=None):
     """
     Save generated point cloud samples as CSV and visualize as 2D images.
     
     Args:
         gen_points: Generated points (B, 3, N) normalized
-        mean: Normalization mean
-        std: Normalization std
+        mean: Normalization mean (用于 standard 模式)
+        std: Normalization std (用于 standard 模式)
         epoch: Current epoch
         output_dir: Output directory
         sample_type: 'eval' or 'traj'
+        normalize_mode: 'standard' 或 'minmax'
+        min_vals: minmax 模式下的平均最小值 (3,)
+        max_vals: minmax 模式下的平均最大值 (3,)
     """
     import pandas as pd
     
@@ -624,15 +698,22 @@ def save_generated_samples(gen_points, mean, std, epoch, output_dir, sample_type
     # Convert to numpy and transpose to (B, N, 3)
     gen_points_np = gen_points.cpu().numpy().transpose(0, 2, 1)
     
-    # Ensure mean and std are 1D arrays for proper broadcasting
-    mean_flat = np.asarray(mean).flatten()
-    std_flat = np.asarray(std).flatten()
-    
     for i in range(min(len(gen_points_np), 16)):  # Save up to 16 samples
         points = gen_points_np[i]  # (N, 3) normalized
         
         # Denormalize to original scale (nm)
-        points_denorm = denormalize_pointcloud(points, mean_flat, std_flat)
+        if normalize_mode == 'minmax' and min_vals is not None and max_vals is not None:
+            # minmax 反归一化: 从 [-1, 1] 到原始尺度
+            min_flat = np.asarray(min_vals).flatten()
+            max_flat = np.asarray(max_vals).flatten()
+            range_vals = max_flat - min_flat
+            points_denorm = (points + 1) / 2 * range_vals + min_flat
+        else:
+            # 标准归一化反变换
+            mean_flat = np.asarray(mean).flatten()
+            std_flat = np.asarray(std).flatten()
+            points_denorm = denormalize_pointcloud(points, mean_flat, std_flat)
+        
         # Ensure 2D shape (N, 3)
         points_denorm = np.asarray(points_denorm).reshape(-1, 3)
         
@@ -698,17 +779,35 @@ def train(gpu, opt, output_dir, noises_init):
     dataloader, _, train_sampler, _ = get_dataloader(opt, train_dataset, None)
     
     # Get normalization parameters from dataset
-    if hasattr(train_dataset, 'all_points_mean') and hasattr(train_dataset, 'all_points_std'):
+    # 判断是否使用 minmax 归一化 (clustered 数据集)
+    use_minmax_norm = isinstance(train_dataset, NUP96ClusteredPointClouds)
+    
+    if use_minmax_norm:
+        # clustered 数据集: 使用平均 min/max 进行反归一化
+        norm_min_vals, norm_max_vals = train_dataset.get_avg_norm_params()
+        norm_mean = train_dataset.all_points_mean  # 兼容性
+        norm_std = train_dataset.all_points_std    # 兼容性
+    elif hasattr(train_dataset, 'all_points_mean') and hasattr(train_dataset, 'all_points_std'):
         norm_mean = train_dataset.all_points_mean
         norm_std = train_dataset.all_points_std
+        norm_min_vals = None
+        norm_max_vals = None
     else:
         norm_mean = np.array([0.0, 0.0, 0.0])
         norm_std = np.array([1.0, 1.0, 1.0])
+        norm_min_vals = None
+        norm_max_vals = None
     
     if should_diag:
         logger.info(f'Dataset size: {len(train_dataset)}')
-        logger.info(f'Normalization mean: {norm_mean}')
-        logger.info(f'Normalization std: {norm_std}')
+        logger.info(f'Dataset mode: {opt.dataset_mode}')
+        logger.info(f'Using minmax normalization: {use_minmax_norm}')
+        if use_minmax_norm:
+            logger.info(f'Avg min_vals: {norm_min_vals}')
+            logger.info(f'Avg max_vals: {norm_max_vals}')
+        else:
+            logger.info(f'Normalization mean: {norm_mean}')
+            logger.info(f'Normalization std: {norm_std}')
 
 
     '''
@@ -749,6 +848,7 @@ def train(gpu, opt, output_dir, noises_init):
 
     if should_diag:
         logger.info(opt)
+        logger.info(f'Model type: {opt.model_type}')
 
     optimizer = optim.AdamW(model.parameters(), lr=opt.lr, weight_decay=opt.decay, betas=(opt.beta1, 0.999))
 
@@ -902,7 +1002,9 @@ def train(gpu, opt, output_dir, noises_init):
 
             # Save generated samples with denormalization and 2D visualization
             img_dir, pts_dir = save_generated_samples(
-                x_gen_eval, norm_mean, norm_std, epoch, output_dir, 'eval'
+                x_gen_eval, norm_mean, norm_std, epoch, output_dir, 'eval',
+                normalize_mode='minmax' if use_minmax_norm else 'standard',
+                min_vals=norm_min_vals, max_vals=norm_max_vals
             )
             logger.info(f'Saved generated samples to {img_dir} and {pts_dir}')
 
@@ -937,6 +1039,9 @@ def train(gpu, opt, output_dir, noises_init):
                     'ema_shadow': ema.shadow,  # Save EMA weights
                     'norm_mean': norm_mean,
                     'norm_std': norm_std,
+                    'use_minmax_norm': use_minmax_norm,
+                    'norm_min_vals': norm_min_vals,
+                    'norm_max_vals': norm_max_vals,
                 }
 
                 torch.save(save_dict, '%s/epoch_%d.pth' % (output_dir, epoch))
@@ -978,6 +1083,25 @@ def main():
     
     print(f'Visible GPUs after CUDA_VISIBLE_DEVICES: {opt.num_gpus}')
     print(f'Remapped GPU ids: {opt.remapped_gpu_ids}')
+    print(f'Using model type: {opt.model_type}')
+    print(f'Dataset mode: {opt.dataset_mode}')
+    
+    if opt.model_type == 'pointcnn':
+        print(f'PointCNN config:')
+        print(f'  - width_multiplier: {opt.pointcnn_width_multiplier}')
+        print(f'  - base_channels: {opt.pointcnn_base_channels}')
+        print(f'  - kernel_size: {opt.pointcnn_kernel_size}')
+        print(f'  - num_layers: {opt.pointcnn_num_layers}')
+        print(f'  - downsample_ratio: {opt.pointcnn_downsample_ratio}')
+    elif opt.model_type == 'gravnet':
+        print(f'GravNet config:')
+        print(f'  - width_multiplier: {opt.gravnet_width_multiplier}')
+        print(f'  - base_channels: {opt.gravnet_base_channels}')
+        print(f'  - space_dimensions: {opt.gravnet_space_dimensions}')
+        print(f'  - propagate_dimensions: {opt.gravnet_propagate_dimensions}')
+        print(f'  - k (nearest neighbors): {opt.gravnet_k}')
+        print(f'  - num_layers: {opt.gravnet_num_layers}')
+        print(f'  - downsample_ratio: {opt.gravnet_downsample_ratio}')
 
     # Create output directory with timestamp and experiment name
     # Format: {output_folder}/{timestamp}_{exp_name}
@@ -992,6 +1116,11 @@ def main():
 
     ''' workaround '''
     train_dataset, _ = get_dataset(opt)
+    # 更新 opt.npoints 以匹配实际数据集的点数
+    actual_npoints = train_dataset.num_points
+    if actual_npoints != opt.npoints:
+        print(f"Updating npoints from {opt.npoints} to {actual_npoints} to match dataset")
+        opt.npoints = actual_npoints
     noises_init = torch.randn(len(train_dataset), opt.npoints, opt.nc)
 
     if opt.dist_url == "env://" and opt.world_size == -1:
@@ -1017,12 +1146,16 @@ def parse_args():
     
     # Data settings
     parser.add_argument('--dataroot', default='/home/djx/data/nup96-large', 
-                        help='Path to NUP96 data root (containing 6-pc-blocks.h5)')
+                        help='Path to NUP96 data root')
+    parser.add_argument('--dataset_mode', type=str, default='clustered',
+                        choices=['h5', 'realtime', 'clustered'],
+                        help='Dataset loading mode: h5 (global norm), realtime (crop from CSV), '
+                             'clustered (minmax norm, 13-clustered-pc-blocks.h5)')
     parser.add_argument('--num_samples', type=int, default=1024,
                         help='Number of samples for realtime mode')
 
     # Training settings
-    parser.add_argument('--bs', type=int, default=8, help='input batch size (larger batch helps stabilize diffusion training)')
+    parser.add_argument('--bs', type=int, default=1, help='input batch size (larger batch helps stabilize diffusion training)')
     parser.add_argument('--workers', type=int, default=4, help='workers')
     parser.add_argument('--niter', type=int, default=10000, help='number of epochs to train for')
 
@@ -1036,6 +1169,8 @@ def parse_args():
     parser.add_argument('--time_num', type=int, default=1000)
 
     # Model params
+    parser.add_argument('--model_type', type=str, default='pointcnn', choices=['pvcnn', 'pointcnn', 'gravnet'],
+                        help='Model type: pvcnn (Point-Voxel CNN), pointcnn (PointCNN with XConv), or gravnet (GravNet with distance-weighted graph)')
     parser.add_argument('--attention', type=bool, default=False)
     parser.add_argument('--dropout', type=float, default=0.05)  # 增加dropout防止过拟合
     parser.add_argument('--embed_dim', type=int, default=64)
@@ -1044,6 +1179,34 @@ def parse_args():
     parser.add_argument('--loss_type', default='mse')
     parser.add_argument('--model_mean_type', default='eps')
     parser.add_argument('--model_var_type', default='fixedsmall')
+    
+    # PointCNN specific params (only used when model_type='pointcnn')
+    parser.add_argument('--pointcnn_width_multiplier', type=float, default=4.0,
+                        help='PointCNN width multiplier: 1.0=~2M params, 2.0=~8M params, 4.0=~32M params')
+    parser.add_argument('--pointcnn_base_channels', type=int, default=128,
+                        help='PointCNN base channel dimension (scaled by width_multiplier)')
+    parser.add_argument('--pointcnn_kernel_size', type=int, default=32,
+                        help='PointCNN XConv kernel size (number of neighbors)')
+    parser.add_argument('--pointcnn_num_layers', type=int, default=4,
+                        help='PointCNN number of encoder/decoder stages')
+    parser.add_argument('--pointcnn_downsample_ratio', type=float, default=0.8,
+                        help='PointCNN FPS downsampling ratio per stage')
+    
+    # GravNet specific params (only used when model_type='gravnet')
+    parser.add_argument('--gravnet_width_multiplier', type=float, default=2.0,
+                        help='GravNet width multiplier: 1.0=~2M params, 2.0=~8M params, 4.0=~32M params')
+    parser.add_argument('--gravnet_base_channels', type=int, default=128,
+                        help='GravNet base channel dimension (scaled by width_multiplier)')
+    parser.add_argument('--gravnet_space_dimensions', type=int, default=6,
+                        help='GravNet space dimensions for learnable neighbor finding (S in paper)')
+    parser.add_argument('--gravnet_propagate_dimensions', type=int, default=16,
+                        help='GravNet propagate dimensions (F_LR in paper)')
+    parser.add_argument('--gravnet_k', type=int, default=32,
+                        help='GravNet number of nearest neighbors')
+    parser.add_argument('--gravnet_num_layers', type=int, default=8,
+                        help='GravNet number of encoder/decoder stages')
+    parser.add_argument('--gravnet_downsample_ratio', type=float, default=0.8,
+                        help='GravNet FPS downsampling ratio per stage')
 
     # Optimizer (optimized for small dataset diffusion training)
     parser.add_argument('--lr', type=float, default=1e-4, help='learning rate (2e-4 works well for diffusion)')
@@ -1054,7 +1217,7 @@ def parse_args():
     parser.add_argument('--use_scheduler', action='store_true', default=False,
                         help='Use learning rate scheduler (ExponentialLR)')
     parser.add_argument('--warmup_epochs', type=int, default=1, help='Number of warmup epochs')
-    parser.add_argument('--ema_decay', type=float, default=0.05, help='EMA decay rate for model averaging')
+    parser.add_argument('--ema_decay', type=float, default=0.99, help='EMA decay rate for model averaging')
 
     parser.add_argument('--model', default='', help="path to model (to continue training)")
 

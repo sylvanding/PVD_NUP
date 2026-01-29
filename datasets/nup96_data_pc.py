@@ -333,6 +333,171 @@ class NUP96PointClouds(Dataset):
         self.train_points = self.all_points
 
 
+class NUP96ClusteredPointClouds(Dataset):
+    """
+    NUP96聚类核孔点云数据集（使用 minmax 归一化）
+    
+    用于加载 13-clustered-csv2h5.py 生成的 H5 文件。
+    每个样本独立归一化到 [-1, 1]，保存了每个样本的 min_vals 和 max_vals。
+    
+    Args:
+        h5_path: H5文件路径
+        num_points: 每个样本的点数（如果需要重采样）
+        split: 数据集划分 ('train', 'val', 'test')
+    """
+    
+    def __init__(self,
+                 h5_path: str,
+                 num_points: int = None,
+                 split: str = 'train'):
+        
+        self.h5_path = h5_path
+        self.split = split
+        self.num_points = num_points
+        
+        self._load_from_h5(h5_path)
+        
+        print(f"NUP96ClusteredPointClouds ({split}): {len(self)} samples, "
+              f"{self.train_points.shape[1]} points each")
+    
+    def _load_from_h5(self, h5_path: str):
+        """从 minmax 归一化的 H5 文件加载数据"""
+        with h5py.File(h5_path, 'r') as f:
+            self.all_points = f['points'][:]  # (B, N, 3) 已归一化到 [-1, 1]
+            self.min_vals = f['min_vals'][:]  # (B, 3) 每个样本的原始最小值
+            self.max_vals = f['max_vals'][:]  # (B, 3) 每个样本的原始最大值
+            
+            # 读取元数据
+            self.normalize_center = f.attrs.get('normalize_center', True)
+            self.normalize_per_shape = f.attrs.get('normalize_per_shape', True)
+            
+            if 'filenames' in f:
+                self.filenames = [fn.decode('utf-8') if isinstance(fn, bytes) else fn
+                                 for fn in f['filenames'][:]]
+            else:
+                self.filenames = None
+        
+        B, N, C = self.all_points.shape
+        
+        # 计算平均归一化参数（用于生成时反归一化）
+        # 方案1: 使用所有样本 min/max 的平均值
+        self.avg_min_vals = self.min_vals.mean(axis=0)  # (3,)
+        self.avg_max_vals = self.max_vals.mean(axis=0)  # (3,)
+        
+        # 方案2: 使用全局的 min 和 max
+        self.global_min_vals = self.min_vals.min(axis=0)  # (3,)
+        self.global_max_vals = self.max_vals.max(axis=0)  # (3,)
+        
+        # 为兼容性设置 all_points_mean 和 all_points_std
+        # 对于 minmax 归一化，我们将平均 min/max 作为 "mean" 和 "std" 的替代
+        # mean = (min + max) / 2, std = (max - min) / 2 (对于 [-1, 1] 范围)
+        self.all_points_mean = (self.avg_min_vals + self.avg_max_vals) / 2
+        self.all_points_std = (self.avg_max_vals - self.avg_min_vals) / 2
+        
+        # 如果需要重采样到指定点数
+        if self.num_points is not None and N != self.num_points:
+            if N > self.num_points:
+                # 降采样
+                sampled_points = []
+                for i in range(B):
+                    sampled = farthest_point_sampling(self.all_points[i], self.num_points)
+                    sampled_points.append(sampled)
+                self.all_points = np.stack(sampled_points, axis=0)
+            else:
+                print(f"Warning: H5 file has {N} points per sample, "
+                      f"but num_points={self.num_points}. Using {N} points.")
+                self.num_points = N
+        else:
+            self.num_points = N
+        
+        self.train_points = self.all_points
+    
+    def get_pc_stats(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        """获取点云的归一化参数"""
+        # 返回该样本的 min/max 作为 mean/std 的替代
+        min_val = self.min_vals[idx].reshape(1, -1)
+        max_val = self.max_vals[idx].reshape(1, -1)
+        return min_val, max_val
+    
+    def get_avg_norm_params(self) -> Tuple[np.ndarray, np.ndarray]:
+        """获取用于生成时反归一化的平均参数"""
+        return self.avg_min_vals, self.avg_max_vals
+    
+    def denormalize(self, normalized: np.ndarray, 
+                   min_vals: np.ndarray = None,
+                   max_vals: np.ndarray = None) -> np.ndarray:
+        """
+        反归一化点云
+        
+        Args:
+            normalized: 归一化的点云 (N, 3) 或 (B, N, 3)
+            min_vals: 最小值，默认使用平均值
+            max_vals: 最大值，默认使用平均值
+            
+        Returns:
+            原始尺度的点云
+        """
+        if min_vals is None:
+            min_vals = self.avg_min_vals
+        if max_vals is None:
+            max_vals = self.avg_max_vals
+        
+        range_vals = max_vals - min_vals
+        
+        if self.normalize_center:
+            # 从 [-1, 1] 反归一化
+            denormalized = (normalized + 1) / 2 * range_vals + min_vals
+        else:
+            # 从 [0, 1] 反归一化
+            denormalized = normalized * range_vals + min_vals
+        
+        return denormalized
+    
+    def __len__(self) -> int:
+        return len(self.train_points)
+    
+    def __getitem__(self, idx: int) -> dict:
+        tr_out = self.train_points[idx]  # (N, 3)
+        tr_out = torch.from_numpy(tr_out).float()
+        
+        min_val, max_val = self.get_pc_stats(idx)
+        
+        return {
+            'idx': idx,
+            'train_points': tr_out,  # (N, 3)
+            'mean': min_val,  # 兼容性：实际是 min_vals
+            'std': max_val,   # 兼容性：实际是 max_vals
+            'min_vals': min_val,
+            'max_vals': max_val,
+            'cate_idx': 0,
+            'sid': 'nup96_clustered',
+            'mid': self.filenames[idx] if self.filenames else f'sample_{idx:04d}'
+        }
+
+
+def get_clustered_nup96_datasets(data_root: str = "/home/djx/data/nup96-large",
+                                 num_points: int = None) -> Tuple[NUP96ClusteredPointClouds, None]:
+    """
+    获取聚类核孔数据集
+    
+    Args:
+        data_root: 数据根目录
+        num_points: 每个样本的点数（如果需要重采样）
+        
+    Returns:
+        train_dataset, None (没有验证集)
+    """
+    h5_path = os.path.join(data_root, "13-clustered-pc-blocks.h5")
+    
+    train_dataset = NUP96ClusteredPointClouds(
+        h5_path=h5_path,
+        num_points=num_points,
+        split='train'
+    )
+    
+    return train_dataset, None
+
+
 def get_nup96_datasets(data_root: str = "/home/djx/data/nup96-large",
                       mode: str = 'h5',
                       num_points: int = 2048,
