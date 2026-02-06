@@ -28,7 +28,8 @@ h5py>=3.0.0
 ```
 
 ```
-pip install torch-scatter torch-sparse torch-cluster torch-spline-conv torch-geometric  -f https://data.pyg.org/whl/torch-2.8.0+cu128.html
+pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu129
+pip install torch-scatter torch-sparse torch-cluster torch-spline-conv torch-geometric  -f https://data.pyg.org/whl/torch-2.8.0+cu129.html
 ```
 
 Install dependencies using:
