@@ -47,7 +47,9 @@ import torch.distributed as dist
 # Import dataset classes
 from datasets.nup96_data_pc import (
     NUP96PointClouds, get_nup96_datasets,
-    NUP96ClusteredPointClouds, get_clustered_nup96_datasets
+    NUP96ClusteredPointClouds, get_clustered_nup96_datasets,
+    CCPClusteredPointClouds, get_clustered_ccp_datasets, CCP_STAGES,
+    NPCClusteredPointClouds, get_clustered_npc_datasets, NPC_SUBFOLDERS
 )
 
 
@@ -617,19 +619,48 @@ def get_betas(schedule_type, b_start, b_end, time_num):
 
 def get_dataset(opt):
     """
-    Get NUP96 dataset based on dataset_mode
+    Get dataset based on dataset_type and dataset_mode
     
-    Modes:
+    Dataset types:
+        - 'nup': NUP96 核孔复合物数据集
+        - 'ccp': CCP (Clathrin-Coated Pit) 数据集
+        - 'npc': NPC (Nuclear Pore Complex) 模拟数据集
+    
+    Modes (for NUP):
         - 'h5': 从预处理的 H5 文件加载（全局归一化）
         - 'realtime': 实时从 CSV 文件裁剪
         - 'clustered': 从聚类核孔 H5 文件加载（minmax 归一化）
+    
+    For CCP:
+        - 总是使用 clustered 模式（minmax 归一化）
+        - 需要指定 ccp_stage
+    
+    For NPC:
+        - 总是使用 clustered 模式（minmax 归一化）
+        - 需要指定 npc_subfolder
     """
-    if opt.dataset_mode == 'clustered':
+    if opt.dataset_type == 'npc':
+        # NPC 数据集
+        train_dataset, val_dataset = get_clustered_npc_datasets(
+            data_root=opt.npc_dataroot,
+            subfolder=opt.npc_subfolder,
+            num_points=opt.npoints
+        )
+    elif opt.dataset_type == 'ccp':
+        # CCP 数据集
+        train_dataset, val_dataset = get_clustered_ccp_datasets(
+            data_root=opt.ccp_dataroot,
+            stage=opt.ccp_stage,
+            num_points=opt.npoints
+        )
+    elif opt.dataset_mode == 'clustered':
+        # NUP96 clustered 模式
         train_dataset, val_dataset = get_clustered_nup96_datasets(
             data_root=opt.dataroot,
             num_points=opt.npoints
         )
     else:
+        # NUP96 其他模式 (h5, realtime)
         train_dataset, val_dataset = get_nup96_datasets(
             data_root=opt.dataroot,
             mode=opt.dataset_mode,
@@ -779,8 +810,8 @@ def train(gpu, opt, output_dir, noises_init):
     dataloader, _, train_sampler, _ = get_dataloader(opt, train_dataset, None)
     
     # Get normalization parameters from dataset
-    # 判断是否使用 minmax 归一化 (clustered 数据集)
-    use_minmax_norm = isinstance(train_dataset, NUP96ClusteredPointClouds)
+    # 判断是否使用 minmax 归一化 (clustered 数据集: NUP96, CCP 或 NPC)
+    use_minmax_norm = isinstance(train_dataset, (NUP96ClusteredPointClouds, CCPClusteredPointClouds, NPCClusteredPointClouds))
     
     if use_minmax_norm:
         # clustered 数据集: 使用平均 min/max 进行反归一化
@@ -1084,7 +1115,15 @@ def main():
     print(f'Visible GPUs after CUDA_VISIBLE_DEVICES: {opt.num_gpus}')
     print(f'Remapped GPU ids: {opt.remapped_gpu_ids}')
     print(f'Using model type: {opt.model_type}')
-    print(f'Dataset mode: {opt.dataset_mode}')
+    print(f'Dataset type: {opt.dataset_type}')
+    if opt.dataset_type == 'npc':
+        print(f'NPC subfolder: {opt.npc_subfolder}')
+        print(f'NPC dataroot: {opt.npc_dataroot}')
+    elif opt.dataset_type == 'ccp':
+        print(f'CCP stage: {opt.ccp_stage}')
+        print(f'CCP dataroot: {opt.ccp_dataroot}')
+    else:
+        print(f'Dataset mode: {opt.dataset_mode}')
     
     if opt.model_type == 'pointcnn':
         print(f'PointCNN config:')
@@ -1145,14 +1184,33 @@ def parse_args():
     parser = argparse.ArgumentParser()
     
     # Data settings
+    parser.add_argument('--dataset_type', type=str, default='npc',
+                        choices=['nup', 'ccp', 'npc'],
+                        help='Dataset type: nup (NUP96 nuclear pore), ccp (Clathrin-Coated Pit), '
+                             'or npc (Nuclear Pore Complex simulation)')
     parser.add_argument('--dataroot', default='/home/djx/data/nup96-large', 
                         help='Path to NUP96 data root')
     parser.add_argument('--dataset_mode', type=str, default='clustered',
                         choices=['h5', 'realtime', 'clustered'],
-                        help='Dataset loading mode: h5 (global norm), realtime (crop from CSV), '
+                        help='Dataset loading mode (for NUP): h5 (global norm), realtime (crop from CSV), '
                              'clustered (minmax norm, 13-clustered-pc-blocks.h5)')
     parser.add_argument('--num_samples', type=int, default=1024,
                         help='Number of samples for realtime mode')
+    
+    # CCP specific settings
+    parser.add_argument('--ccp_dataroot', default='/home/djx/data0/pvd_nup/ccp_stages/outputs',
+                        help='Path to CCP data outputs root')
+    parser.add_argument('--ccp_stage', type=str, default='early',
+                        choices=['early', 'mid_early', 'middle', 'mid_late', 'late', 'mature'],
+                        help='CCP developmental stage to use')
+    
+    # NPC specific settings
+    parser.add_argument('--npc_dataroot', default='/data0/djx/pvd_nup/npc_batch/processed',
+                        help='Path to NPC data outputs root')
+    parser.add_argument('--npc_subfolder', type=str, default='rotated_density_0_9',
+                        choices=['rotated_density_0_9', 'rotated_density_0_7', 'rotated_density_0_5',
+                                 'fixed_density_0_9', 'fixed_density_0_7', 'fixed_density_0_5'],
+                        help='NPC subfolder to use (rotation type + density)')
 
     # Training settings
     parser.add_argument('--bs', type=int, default=1, help='input batch size (larger batch helps stabilize diffusion training)')
