@@ -498,6 +498,366 @@ def get_clustered_nup96_datasets(data_root: str = "/home/djx/data/nup96-large",
     return train_dataset, None
 
 
+class CCPClusteredPointClouds(Dataset):
+    """
+    CCP (Clathrin-Coated Pit) 聚类点云数据集（使用 minmax 归一化）
+    
+    用于加载 data_prepare/ccp/3-ccp-csv2h5.py 生成的 H5 文件。
+    每个样本独立归一化到 [-1, 1]，保存了每个样本的 min_vals 和 max_vals。
+    
+    Args:
+        h5_path: H5文件路径
+        num_points: 每个样本的点数（如果需要重采样）
+        split: 数据集划分 ('train', 'val', 'test')
+        stage: CCP发育时期名称（用于日志输出）
+    """
+    
+    def __init__(self,
+                 h5_path: str,
+                 num_points: int = None,
+                 split: str = 'train',
+                 stage: str = 'unknown'):
+        
+        self.h5_path = h5_path
+        self.split = split
+        self.num_points = num_points
+        self.stage = stage
+        
+        self._load_from_h5(h5_path)
+        
+        print(f"CCPClusteredPointClouds ({stage}, {split}): {len(self)} samples, "
+              f"{self.train_points.shape[1]} points each")
+    
+    def _load_from_h5(self, h5_path: str):
+        """从 minmax 归一化的 H5 文件加载数据"""
+        with h5py.File(h5_path, 'r') as f:
+            self.all_points = f['points'][:]  # (B, N, 3) 已归一化到 [-1, 1]
+            self.min_vals = f['min_vals'][:]  # (B, 3) 每个样本的原始最小值
+            self.max_vals = f['max_vals'][:]  # (B, 3) 每个样本的原始最大值
+            
+            # 读取元数据
+            self.normalize_center = f.attrs.get('normalize_center', True)
+            self.normalize_per_shape = f.attrs.get('normalize_per_shape', True)
+            
+            if 'filenames' in f:
+                self.filenames = [fn.decode('utf-8') if isinstance(fn, bytes) else fn
+                                 for fn in f['filenames'][:]]
+            else:
+                self.filenames = None
+        
+        B, N, C = self.all_points.shape
+        
+        # 计算平均归一化参数（用于生成时反归一化）
+        self.avg_min_vals = self.min_vals.mean(axis=0)  # (3,)
+        self.avg_max_vals = self.max_vals.mean(axis=0)  # (3,)
+        
+        # 全局的 min 和 max
+        self.global_min_vals = self.min_vals.min(axis=0)  # (3,)
+        self.global_max_vals = self.max_vals.max(axis=0)  # (3,)
+        
+        # 为兼容性设置 all_points_mean 和 all_points_std
+        self.all_points_mean = (self.avg_min_vals + self.avg_max_vals) / 2
+        self.all_points_std = (self.avg_max_vals - self.avg_min_vals) / 2
+        
+        # 如果需要重采样到指定点数
+        if self.num_points is not None and N != self.num_points:
+            if N > self.num_points:
+                sampled_points = []
+                for i in range(B):
+                    sampled = farthest_point_sampling(self.all_points[i], self.num_points)
+                    sampled_points.append(sampled)
+                self.all_points = np.stack(sampled_points, axis=0)
+            else:
+                print(f"Warning: H5 file has {N} points per sample, "
+                      f"but num_points={self.num_points}. Using {N} points.")
+                self.num_points = N
+        else:
+            self.num_points = N
+        
+        self.train_points = self.all_points
+    
+    def get_pc_stats(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        """获取点云的归一化参数"""
+        min_val = self.min_vals[idx].reshape(1, -1)
+        max_val = self.max_vals[idx].reshape(1, -1)
+        return min_val, max_val
+    
+    def get_avg_norm_params(self) -> Tuple[np.ndarray, np.ndarray]:
+        """获取用于生成时反归一化的平均参数"""
+        return self.avg_min_vals, self.avg_max_vals
+    
+    def denormalize(self, normalized: np.ndarray, 
+                   min_vals: np.ndarray = None,
+                   max_vals: np.ndarray = None) -> np.ndarray:
+        """
+        反归一化点云
+        
+        Args:
+            normalized: 归一化的点云 (N, 3) 或 (B, N, 3)
+            min_vals: 最小值，默认使用平均值
+            max_vals: 最大值，默认使用平均值
+            
+        Returns:
+            原始尺度的点云
+        """
+        if min_vals is None:
+            min_vals = self.avg_min_vals
+        if max_vals is None:
+            max_vals = self.avg_max_vals
+        
+        range_vals = max_vals - min_vals
+        
+        if self.normalize_center:
+            denormalized = (normalized + 1) / 2 * range_vals + min_vals
+        else:
+            denormalized = normalized * range_vals + min_vals
+        
+        return denormalized
+    
+    def __len__(self) -> int:
+        return len(self.train_points)
+    
+    def __getitem__(self, idx: int) -> dict:
+        tr_out = self.train_points[idx]  # (N, 3)
+        tr_out = torch.from_numpy(tr_out).float()
+        
+        min_val, max_val = self.get_pc_stats(idx)
+        
+        return {
+            'idx': idx,
+            'train_points': tr_out,  # (N, 3)
+            'mean': min_val,  # 兼容性：实际是 min_vals
+            'std': max_val,   # 兼容性：实际是 max_vals
+            'min_vals': min_val,
+            'max_vals': max_val,
+            'cate_idx': 0,
+            'sid': f'ccp_{self.stage}',
+            'mid': self.filenames[idx] if self.filenames else f'sample_{idx:04d}'
+        }
+
+
+# CCP 发育时期列表
+CCP_STAGES = ['early', 'mid_early', 'middle', 'mid_late', 'late', 'mature']
+
+# NPC 子文件夹列表
+NPC_SUBFOLDERS = [
+    'rotated_density_0_9',
+    'rotated_density_0_7',
+    'rotated_density_0_5',
+    'fixed_density_0_9',
+    'fixed_density_0_7',
+    'fixed_density_0_5'
+]
+
+
+class NPCClusteredPointClouds(Dataset):
+    """
+    NPC (Nuclear Pore Complex) 聚类点云数据集（使用 minmax 归一化）
+    
+    用于加载 data_prepare/npc/3-npc-csv2h5.py 生成的 H5 文件。
+    每个样本独立归一化到 [-1, 1]，保存了每个样本的 min_vals 和 max_vals。
+    
+    Args:
+        h5_path: H5文件路径
+        num_points: 每个样本的点数（如果需要重采样）
+        split: 数据集划分 ('train', 'val', 'test')
+        subfolder: NPC子文件夹名称（用于日志输出）
+    """
+    
+    def __init__(self,
+                 h5_path: str,
+                 num_points: int = None,
+                 split: str = 'train',
+                 subfolder: str = 'unknown'):
+        
+        self.h5_path = h5_path
+        self.split = split
+        self.num_points = num_points
+        self.subfolder = subfolder
+        
+        self._load_from_h5(h5_path)
+        
+        print(f"NPCClusteredPointClouds ({subfolder}, {split}): {len(self)} samples, "
+              f"{self.train_points.shape[1]} points each")
+    
+    def _load_from_h5(self, h5_path: str):
+        """从 minmax 归一化的 H5 文件加载数据"""
+        with h5py.File(h5_path, 'r') as f:
+            self.all_points = f['points'][:]  # (B, N, 3) 已归一化到 [-1, 1]
+            self.min_vals = f['min_vals'][:]  # (B, 3) 每个样本的原始最小值
+            self.max_vals = f['max_vals'][:]  # (B, 3) 每个样本的原始最大值
+            
+            # 读取元数据
+            self.normalize_center = f.attrs.get('normalize_center', True)
+            self.normalize_per_shape = f.attrs.get('normalize_per_shape', True)
+            
+            if 'filenames' in f:
+                self.filenames = [fn.decode('utf-8') if isinstance(fn, bytes) else fn
+                                 for fn in f['filenames'][:]]
+            else:
+                self.filenames = None
+        
+        B, N, C = self.all_points.shape
+        
+        # 计算平均归一化参数（用于生成时反归一化）
+        self.avg_min_vals = self.min_vals.mean(axis=0)  # (3,)
+        self.avg_max_vals = self.max_vals.mean(axis=0)  # (3,)
+        
+        # 全局的 min 和 max
+        self.global_min_vals = self.min_vals.min(axis=0)  # (3,)
+        self.global_max_vals = self.max_vals.max(axis=0)  # (3,)
+        
+        # 为兼容性设置 all_points_mean 和 all_points_std
+        self.all_points_mean = (self.avg_min_vals + self.avg_max_vals) / 2
+        self.all_points_std = (self.avg_max_vals - self.avg_min_vals) / 2
+        
+        # 如果需要重采样到指定点数
+        if self.num_points is not None and N != self.num_points:
+            if N > self.num_points:
+                sampled_points = []
+                for i in range(B):
+                    sampled = farthest_point_sampling(self.all_points[i], self.num_points)
+                    sampled_points.append(sampled)
+                self.all_points = np.stack(sampled_points, axis=0)
+            else:
+                print(f"Warning: H5 file has {N} points per sample, "
+                      f"but num_points={self.num_points}. Using {N} points.")
+                self.num_points = N
+        else:
+            self.num_points = N
+        
+        self.train_points = self.all_points
+    
+    def get_pc_stats(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        """获取点云的归一化参数"""
+        min_val = self.min_vals[idx].reshape(1, -1)
+        max_val = self.max_vals[idx].reshape(1, -1)
+        return min_val, max_val
+    
+    def get_avg_norm_params(self) -> Tuple[np.ndarray, np.ndarray]:
+        """获取用于生成时反归一化的平均参数"""
+        return self.avg_min_vals, self.avg_max_vals
+    
+    def denormalize(self, normalized: np.ndarray, 
+                   min_vals: np.ndarray = None,
+                   max_vals: np.ndarray = None) -> np.ndarray:
+        """
+        反归一化点云
+        
+        Args:
+            normalized: 归一化的点云 (N, 3) 或 (B, N, 3)
+            min_vals: 最小值，默认使用平均值
+            max_vals: 最大值，默认使用平均值
+            
+        Returns:
+            原始尺度的点云
+        """
+        if min_vals is None:
+            min_vals = self.avg_min_vals
+        if max_vals is None:
+            max_vals = self.avg_max_vals
+        
+        range_vals = max_vals - min_vals
+        
+        if self.normalize_center:
+            denormalized = (normalized + 1) / 2 * range_vals + min_vals
+        else:
+            denormalized = normalized * range_vals + min_vals
+        
+        return denormalized
+    
+    def __len__(self) -> int:
+        return len(self.train_points)
+    
+    def __getitem__(self, idx: int) -> dict:
+        tr_out = self.train_points[idx]  # (N, 3)
+        tr_out = torch.from_numpy(tr_out).float()
+        
+        min_val, max_val = self.get_pc_stats(idx)
+        
+        return {
+            'idx': idx,
+            'train_points': tr_out,  # (N, 3)
+            'mean': min_val,  # 兼容性：实际是 min_vals
+            'std': max_val,   # 兼容性：实际是 max_vals
+            'min_vals': min_val,
+            'max_vals': max_val,
+            'cate_idx': 0,
+            'sid': f'npc_{self.subfolder}',
+            'mid': self.filenames[idx] if self.filenames else f'sample_{idx:04d}'
+        }
+
+
+def get_clustered_npc_datasets(data_root: str = "/data0/djx/pvd_nup/npc_batch/processed",
+                               subfolder: str = 'rotated_density_0_9',
+                               num_points: int = None) -> Tuple[NPCClusteredPointClouds, None]:
+    """
+    获取NPC聚类点云数据集
+    
+    Args:
+        data_root: 数据输出根目录（包含各子文件夹）
+        subfolder: NPC子文件夹 ('rotated_density_0_9', 'fixed_density_0_5', 等)
+        num_points: 每个样本的点数（如果需要重采样）
+        
+    Returns:
+        train_dataset, None (没有验证集)
+    """
+    if subfolder not in NPC_SUBFOLDERS:
+        raise ValueError(f"Unknown NPC subfolder: {subfolder}. Choose from {NPC_SUBFOLDERS}")
+    
+    h5_path = os.path.join(data_root, subfolder, f"npc_{subfolder}.h5")
+    
+    if not os.path.exists(h5_path):
+        raise FileNotFoundError(
+            f"NPC H5 file not found: {h5_path}\n"
+            f"Please run: python data_prepare/npc/run_all.py --subfolder {subfolder}"
+        )
+    
+    train_dataset = NPCClusteredPointClouds(
+        h5_path=h5_path,
+        num_points=num_points,
+        split='train',
+        subfolder=subfolder
+    )
+    
+    return train_dataset, None
+
+
+def get_clustered_ccp_datasets(data_root: str = "/home/djx/data0/pvd_nup/ccp_stages/outputs",
+                               stage: str = 'early',
+                               num_points: int = None) -> Tuple[CCPClusteredPointClouds, None]:
+    """
+    获取CCP聚类点云数据集
+    
+    Args:
+        data_root: 数据输出根目录（包含各时期子目录）
+        stage: CCP发育时期 ('early', 'mid_early', 'middle', 'mid_late', 'late', 'mature')
+        num_points: 每个样本的点数（如果需要重采样）
+        
+    Returns:
+        train_dataset, None (没有验证集)
+    """
+    if stage not in CCP_STAGES:
+        raise ValueError(f"Unknown CCP stage: {stage}. Choose from {CCP_STAGES}")
+    
+    h5_path = os.path.join(data_root, stage, f"ccp_{stage}.h5")
+    
+    if not os.path.exists(h5_path):
+        raise FileNotFoundError(
+            f"CCP H5 file not found: {h5_path}\n"
+            f"Please run: python data_prepare/ccp/run_all.py --stage {stage}"
+        )
+    
+    train_dataset = CCPClusteredPointClouds(
+        h5_path=h5_path,
+        num_points=num_points,
+        split='train',
+        stage=stage
+    )
+    
+    return train_dataset, None
+
+
 def get_nup96_datasets(data_root: str = "/home/djx/data/nup96-large",
                       mode: str = 'h5',
                       num_points: int = 2048,
